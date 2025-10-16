@@ -1,0 +1,220 @@
+name: Auto TDD Setup
+
+on:
+  issues:
+    types: [opened, labeled]
+
+jobs:
+  setup-tdd:
+    # Only run if issue has 'feature-request' label
+    if: contains(github.event.issue.labels.*.name, 'feature-request')
+    runs-on: ubuntu-latest
+    
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Parse issue and extract component details
+        id: parse
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const issueBody = context.payload.issue.body;
+            const issueNumber = context.payload.issue.number;
+            const issueTitle = context.payload.issue.title;
+            
+            // Extract component name from title (expects format: "[FEATURE] ComponentName - Description")
+            const componentMatch = issueTitle.match(/\[FEATURE\]\s+(\w+)/i);
+            const componentName = componentMatch ? componentMatch[1] : `Component${issueNumber}`;
+            
+            // Parse issue body to extract requirements
+            const sections = {
+              userStory: '',
+              acceptanceCriteria: [],
+              testScenarios: [],
+              componentDetails: {},
+              apiRequirements: ''
+            };
+            
+            // Parse user story
+            const userStoryMatch = issueBody.match(/## User Story\n([\s\S]*?)(?=\n##|$)/);
+            if (userStoryMatch) {
+              sections.userStory = userStoryMatch[1].trim();
+            }
+            
+            // Parse acceptance criteria
+            const acceptanceMatch = issueBody.match(/## Acceptance Criteria\n([\s\S]*?)(?=\n##|$)/);
+            if (acceptanceMatch) {
+              sections.acceptanceCriteria = acceptanceMatch[1]
+                .split('\n')
+                .filter(line => line.trim().startsWith('- '))
+                .map(line => line.replace(/^-\s*\[.\]\s*/, '').trim());
+            }
+            
+            // Parse test scenarios
+            const testScenariosMatch = issueBody.match(/## Test Scenarios\n([\s\S]*?)(?=\n##|$)/);
+            if (testScenariosMatch) {
+              const scenarios = testScenariosMatch[1];
+              
+              // Extract happy path
+              const happyPathMatch = scenarios.match(/### Happy Path\n([\s\S]*?)(?=\n###|$)/);
+              if (happyPathMatch) {
+                sections.testScenarios.push({
+                  type: 'happy',
+                  scenarios: happyPathMatch[1]
+                    .split('\n')
+                    .filter(line => line.trim().startsWith('- '))
+                    .map(line => line.replace(/^-\s*\[.\]\s*/, '').trim())
+                });
+              }
+              
+              // Extract edge cases
+              const edgeCasesMatch = scenarios.match(/### Edge Cases\n([\s\S]*?)(?=\n###|$)/);
+              if (edgeCasesMatch) {
+                sections.testScenarios.push({
+                  type: 'edge',
+                  scenarios: edgeCasesMatch[1]
+                    .split('\n')
+                    .filter(line => line.trim().startsWith('- '))
+                    .map(line => line.replace(/^-\s*\[.\]\s*/, '').trim())
+                });
+              }
+              
+              // Extract error cases
+              const errorCasesMatch = scenarios.match(/### Error Cases\n([\s\S]*?)(?=\n###|$)/);
+              if (errorCasesMatch) {
+                sections.testScenarios.push({
+                  type: 'error',
+                  scenarios: errorCasesMatch[1]
+                    .split('\n')
+                    .filter(line => line.trim().startsWith('- '))
+                    .map(line => line.replace(/^-\s*\[.\]\s*/, '').trim())
+                });
+              }
+            }
+            
+            // Parse component details
+            const componentDetailsMatch = issueBody.match(/## Component Details\n([\s\S]*?)(?=\n##|$)/);
+            if (componentDetailsMatch) {
+              const details = componentDetailsMatch[1];
+              const propsMatch = details.match(/\*\*Props\*\*:\s*(.*)/);
+              const eventsMatch = details.match(/\*\*Events\*\*:\s*(.*)/);
+              const stateMatch = details.match(/\*\*State Management\*\*:\s*(.*)/);
+              
+              sections.componentDetails = {
+                props: propsMatch ? propsMatch[1].trim() : '',
+                events: eventsMatch ? eventsMatch[1].trim() : '',
+                state: stateMatch ? stateMatch[1].trim() : ''
+              };
+            }
+            
+            // Store parsed data for next steps
+            core.setOutput('component_name', componentName);
+            core.setOutput('issue_number', issueNumber);
+            core.setOutput('parsed_requirements', JSON.stringify(sections));
+            
+            return { componentName, issueNumber, sections };
+      
+      - name: Create feature branch
+        run: |
+          BRANCH_NAME="feature/${{ steps.parse.outputs.issue_number }}-${{ steps.parse.outputs.component_name }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b $BRANCH_NAME
+          echo "BRANCH_NAME=$BRANCH_NAME" >> $GITHUB_ENV
+
+      - name: Generate component scaffold
+        run: |
+          node scripts/create-tdd-component.js ${{ steps.parse.outputs.component_name }} "Issue #${{ steps.parse.outputs.issue_number }}: ${{ github.event.issue.title }}"
+
+      - name: Generate tests from issue requirements
+        id: generate_tests
+        run: |
+          # Parse requirements and generate tests using shared library
+          REQUIREMENTS='${{ steps.parse.outputs.parsed_requirements }}'
+          COMPONENT_NAME='${{ steps.parse.outputs.component_name }}'
+          ISSUE_NUMBER='${{ steps.parse.outputs.issue_number }}'
+          ISSUE_TITLE='${{ github.event.issue.title }}'
+
+          # Generate test content using our shared library
+          node scripts/generate-tests-from-issue.js \
+            "$COMPONENT_NAME" \
+            "$REQUIREMENTS" \
+            "$ISSUE_NUMBER" \
+            "$ISSUE_TITLE" > test_output.log 2>&1
+
+          # Extract test content
+          TEST_CONTENT=$(sed -n '/TEST_CONTENT_START/,/TEST_CONTENT_END/p' test_output.log | sed '1d;$d')
+
+          # Write to test file
+          TEST_FILE="src/components/${COMPONENT_NAME}.test.ts"
+          echo "$TEST_CONTENT" > "$TEST_FILE"
+
+          # Show generation summary
+          cat test_output.log | grep -E "^(✅|⚠️|❌)"
+
+          echo "test_file=$TEST_FILE" >> $GITHUB_OUTPUT
+      
+      - name: Commit changes
+        run: |
+          git add .
+          git commit -m "test: auto-generate tests for ${{ steps.parse.outputs.component_name }} from issue #${{ steps.parse.outputs.issue_number }}
+          
+          Co-authored-by: github-actions[bot] <github-actions[bot]@users.noreply.github.com>"
+      
+      - name: Push branch
+        run: |
+          git push origin ${{ env.BRANCH_NAME }}
+      
+      - name: Comment on Issue
+        uses: actions/github-script@v6
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: ${{ steps.parse.outputs.issue_number }},
+              body: `🤖 **TDD Setup Complete!**
+
+              I've automatically created a TDD setup for this feature:
+
+              ### ✅ What was created:
+              - **Branch**: \`${process.env.BRANCH_NAME}\`
+              - **Component**: \`src/components/${{ steps.parse.outputs.component_name }}.vue\`
+              - **Tests**: \`src/components/${{ steps.parse.outputs.component_name }}.test.ts\`
+
+              ### 🔴 TDD Red Phase
+              All tests are currently **failing** (as expected in TDD). This is the RED phase.
+
+              ### 🚀 To start developing:
+              \`\`\`bash
+              git fetch origin
+              git checkout ${process.env.BRANCH_NAME}
+              npm install
+              npm run tdd
+              \`\`\`
+
+              ### 📋 Next Steps:
+              1. **GREEN Phase**: Implement \`${{ steps.parse.outputs.component_name }}.vue\` to make tests pass
+              2. **REFACTOR Phase**: Clean up code while keeping tests green
+              3. **Create PR**: When ready, create a PR from your branch
+
+              ---
+              💡 **Tip**: Run \`npm run tdd\` to see tests in watch mode. Each test has a TODO comment explaining what needs to be implemented.`
+            });
